@@ -1,0 +1,1 @@
+/home/omen212/projects/active/sysh/sysht-tui/target/release/sysht-tui: /home/omen212/projects/active/sysh/sysht-tui/src/app.rs /home/omen212/projects/active/sysh/sysht-tui/src/health.rs /home/omen212/projects/active/sysh/sysht-tui/src/main.rs /home/omen212/projects/active/sysh/sysht-tui/src/theme.rs /home/omen212/projects/active/sysh/sysht-tui/src/tui.rs

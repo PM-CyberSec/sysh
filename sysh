@@ -1,0 +1,1140 @@
+#!/usr/bin/env bash
+# sysh — System Health CLI (full version, Linux-only)
+# Usage: sysh [-j|--json] [--json-only] [-o FILE|--output FILE] [--no-file] [-n N|--top N] [--no-color] [--no-alert] [--alert]
+# Stands for: System Health. Outputs to stdout AND file by default (tee).
+# Design: modular functions, categorized disk tables, thresholds, JSON optional.
+set -eu
+set -o pipefail 2>/dev/null || true
+# allow pipelines like  cmd | head | while to not abort on SIGPIPE; disable strict pipefail after header
+set +o pipefail 2>/dev/null || true
+
+# ─── defaults ───────────────────────────────────────────────────────────────
+TOP_N=10
+DO_JSON=0
+JSON_ONLY=0
+DO_FILE=1
+DO_COLOR=1
+DO_ALERT=1
+DO_VIRT=0
+LOGFILE=""
+THRESH_DISK=90
+THRESH_INODE=90
+THRESH_MEM=85
+THRESH_SWAP=80
+THRESH_CPU_LOAD_PER_CORE=2.0  # load1 / nproc
+
+# virt totals for JSON / calc
+VIRT_TOTAL_VIRTUAL=0
+VIRT_TOTAL_ACTUAL=0
+VIRT_TOTAL_REMAINING=0
+VIRT_HOST_FREE=0
+VIRT_ACTUAL_LEFT=0
+
+# detect if stdout is tty for auto color
+if [[ ! -t 1 ]]; then
+  # still allow color if user forces --no-color not set; but default off when piped
+  # keep DO_COLOR=1 unless --no-color, but we'll disable if piped and no force flag
+  :
+fi
+
+# ─── argument parsing ───────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      cat <<'EOF'
+sysh — System Health (Linux-only, full version)
+Usage: sysh [OPTIONS]
+
+Outputs human-readable health report to stdout AND to a logfile concurrently.
+
+Options:
+  -h, --help              Show this help
+  -j, --json              Also emit JSON (to stdout after report, and to .json file)
+      --json-only         Only emit JSON (no human report)
+  -o, --output FILE       Log file path (default: ./sysh-YYYYmmdd_HHMMSS.log)
+      --no-file           Disable file output (stdout only)
+  -n, --top N             Number of entries for Top-N tables (default: 10)
+      --no-color          Disable ANSI colors
+      --no-alert          Disable threshold WARN/CRIT alerts (auto feature off)
+      --alert             Enable alerts (default: on)
+      --threshold-disk N  Disk usage % threshold (default: 90)
+      --threshold-mem N   RAM usage % threshold (default: 85)
+      --threshold-inode N Inode usage % threshold (default: 90)
+      --virt              Enable thin-provisioned virtual image scan (qcow2/vdi/vmdk)
+                          Shows virtual vs actual size and calculates:
+                          actual_left = host_free - total_remaining
+                          (host_free from df, remaining = virtual - actual)
+      --no-virt           Disable virt scan (default)
+  Examples:
+    sysh                        # stdout + ./sysh-*.log with tables + alerts
+    sysh -n 20 -o ~/health.log  # 20 rows, custom log
+    sysh --json                 # also writes .json alongside .log
+    sysh --json-only | jq .     # pipeable JSON
+    sysh --no-alert --no-file   # plain report, no alerts, no file
+    sysh --virt -n 20           # include thin-provisioned virt images + calculation
+    sysh --virt --json | jq .virt
+
+Sections: header, cpu, memory, disk (categorized), network, processes, services, logs, sensors, alerts, virt(thin)
+Disk categories: filesystems, inodes, block devices, top largest files, top directories, top programs/packages, docker, snap/flatpak
+Virt categories: qcow2/vdi/vmdk/vhd/vhdx/img/images + LVM thin pools + sparse files, table + overcommit calc
+
+Commands used (with fallback):
+  header:  hostname, uname -a, uptime, date, who, /proc/loadavg
+  cpu:     lscpu, nproc, mpstat|/proc/stat, /proc/loadavg, uptime
+  memory:  free -h, /proc/meminfo, vmstat -s
+  disk:    df -hT, df -i, lsblk, du -sh, find, dpkg-query, docker system df, snap/flatpak
+  virt:    find (*.qcow2/.vdi/.vmdk/.vhd/.vhdx/*.img), qemu-img info --output=json, du, stat, lvs, virsh pool-list, du --apparent-size
+  network: ip, ss, ping, /proc/net/dev
+  ps:      ps aux, /proc/stat
+  systemd: systemctl, journalctl, dmesg
+  sensors: sensors, /sys/class/thermal/*, upower
+
+Exit codes: 0 ok, 1 warn threshold exceeded, 2 crit/error
+Calculation: actual_left_free = host_free_bytes - sum(virtual - actual)
+           => if negative => overcommitted thin provisioning.
+EOF
+      exit 0
+      ;;
+    -j|--json) DO_JSON=1; shift ;;
+    --json-only) DO_JSON=1; JSON_ONLY=1; shift ;;
+    -o|--output) LOGFILE="$2"; shift 2 ;;
+    --no-file) DO_FILE=0; shift ;;
+    -n|--top) TOP_N="$2"; shift 2 ;;
+    --no-color) DO_COLOR=0; shift ;;
+    --no-alert) DO_ALERT=0; shift ;;
+    --alert) DO_ALERT=1; shift ;;
+    --virt) DO_VIRT=1; shift ;;
+    --no-virt) DO_VIRT=0; shift ;;
+    --threshold-disk) THRESH_DISK="$2"; shift 2 ;;
+    --threshold-mem) THRESH_MEM="$2"; shift 2 ;;
+    --threshold-inode) THRESH_INODE="$2"; shift 2 ;;
+    *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+  esac
+done
+
+# validate TOP_N numeric
+if ! [[ "$TOP_N" =~ ^[0-9]+$ ]] || [[ "$TOP_N" -lt 1 ]]; then
+  echo "Invalid --top value: $TOP_N" >&2; exit 2
+fi
+
+if [[ $DO_COLOR -eq 1 ]] && [[ ! -t 1 ]] && [[ $JSON_ONLY -eq 0 ]]; then
+  # keep color even when piped? decision: disable when not tty to keep logs clean
+  # but file separately will be stripped; for now keep color on tty only
+  :
+fi
+if [[ $DO_COLOR -eq 0 ]]; then
+  # forced off
+  :
+fi
+
+# auto logfile default
+if [[ $DO_FILE -eq 1 && -z "$LOGFILE" ]]; then
+  LOGFILE="./sysh-$(date +%Y%m%d_%H%M%S).log"
+fi
+JSONFILE=""
+if [[ $DO_JSON -eq 1 && $DO_FILE -eq 1 && -n "$LOGFILE" ]]; then
+  JSONFILE="${LOGFILE%.log}.json"
+  if [[ "$JSONFILE" == "$LOGFILE" ]]; then
+    JSONFILE="${LOGFILE}.json"
+  fi
+fi
+
+# ─── color helpers ──────────────────────────────────────────────────────────
+if [[ $DO_COLOR -eq 1 ]]; then
+  C_RESET="\033[0m"; C_BOLD="\033[1m"; C_DIM="\033[2m"
+  C_RED="\033[0;31m"; C_GREEN="\033[0;32m"; C_YELLOW="\033[0;33m"
+  C_BLUE="\033[0;34m"; C_MAGENTA="\033[0;35m"; C_CYAN="\033[0;36m"
+  C_WHITE="\033[0;37m"; C_BG_DARK="\033[48;5;235m"
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_WHITE=""; C_BG_DARK=""
+fi
+
+strip_ansi() { sed -E 's/\x1B\[[0-9;]*[mGKHF]//g'; }
+
+# streaming + file tee (stdout & file). If JSON_ONLY, suppress human output.
+# Use buffers for potential json generation, but also stream immediately so timeouts still show partial.
+REPORT_BUF=""
+REPORT_BUF_PLAIN=""
+
+append() {
+  local line="$1"
+  REPORT_BUF+="$line"$'\n'
+  local plain
+  plain="$(printf '%s\n' "$line" | strip_ansi)"
+  REPORT_BUF_PLAIN+="$plain"$'\n'
+  if [[ ${JSON_ONLY:-0} -eq 0 ]]; then
+    printf '%b\n' "$line"
+    if [[ $DO_FILE -eq 1 && -n "${LOGFILE:-}" ]]; then
+      # ensure log dir exists and append stripped
+      mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+      printf '%s\n' "$plain" >> "$LOGFILE"
+    fi
+  fi
+}
+append_raw() { printf '%b' "$1"; }
+
+print_section() {
+  local title="$1"
+  append ""
+  append "${C_CYAN}${C_BOLD}━━━ ${title} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+}
+
+# table helpers
+table_header() {
+  # args: col1 col2 col3...
+  local fmt=""
+  for c in "$@"; do fmt+="%-18s "; done
+  # use dynamic fmt per caller instead; this is generic placeholder
+  append "${C_DIM}$*${C_RESET}"
+  append "${C_DIM}$(printf '─%.0s' $(seq 1 90))${C_RESET}"
+}
+hr() { append "${C_DIM}$(printf '─%.0s' $(seq 1 90))${C_RESET}"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ─── data collectors (for JSON) ────────────────────────────────────────────
+JSON_HOSTNAME=""; JSON_KERNEL=""; JSON_UPTIME=""; JSON_LOAD=""; JSON_DATE=""
+JSON_CPU_MODEL=""; JSON_CPU_CORES=""; JSON_CPU_LOAD1=""; JSON_MEM_TOTAL_KB=""; JSON_MEM_AVAIL_KB=""; JSON_SWAP_TOTAL_KB=""
+JSON_DF_JSON=""; JSON_LSBLK_JSON=""; JSON_ALERTS=()
+
+add_alert() { JSON_ALERTS+=("$1"); }
+
+# ─── SECTION 1: HEADER ──────────────────────────────────────────────────────
+collect_header() {
+  JSON_HOSTNAME="$(hostname 2>/dev/null || echo unknown)"
+  JSON_KERNEL="$(uname -r 2>/dev/null || echo unknown)"
+  JSON_DATE="$(date -Is 2>/dev/null || date)"
+  JSON_UPTIME="$(uptime -p 2>/dev/null || cat /proc/uptime 2>/dev/null || echo unknown)"
+}
+
+render_header() {
+  print_section "SYSTEM HEADER"
+  local hn kernel up pretty_up load users
+  hn="$(hostname 2>/dev/null || echo '?')"
+  kernel="$(uname -a 2>/dev/null || echo '?')"
+  pretty_up="$(uptime -p 2>/dev/null || echo "up $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s")"
+  load="$(cat /proc/loadavg 2>/dev/null || echo '?')"
+  users="$(who 2>/dev/null | wc -l | tr -d ' ')"
+  JSON_LOAD="$load"
+  append "${C_BOLD}Hostname:${C_RESET}  $hn"
+  append "${C_BOLD}Kernel:${C_RESET}    $kernel"
+  append "${C_BOLD}Date:${C_RESET}      $(date)"
+  append "${C_BOLD}Uptime:${C_RESET}    $pretty_up  (since $(uptime -s 2>/dev/null || echo '?'))"
+  append "${C_BOLD}LoadAvg:${C_RESET}   $load  (1/5/15m)"
+  append "${C_BOLD}Users:${C_RESET}     $users logged in  —  $(who 2>/dev/null | head -n 3 | tr '\n' ';' || echo '')"
+  # threshold: load per core
+  if [[ $DO_ALERT -eq 1 ]]; then
+    local nproc load1
+    nproc="$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)"
+    load1="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)"
+    if awk "BEGIN{exit !($load1 > ($nproc * $THRESH_CPU_LOAD_PER_CORE))}" 2>/dev/null; then
+      append "${C_YELLOW}⚠ High load: $load1 on $nproc cores (threshold ${THRESH_CPU_LOAD_PER_CORE}/core)${C_RESET}"
+      add_alert "{\"level\":\"warn\",\"check\":\"cpu_load\",\"msg\":\"load $load1 on $nproc cores\"}"
+    fi
+  fi
+}
+
+# ─── SECTION 2: CPU ─────────────────────────────────────────────────────────
+render_cpu() {
+  print_section "CPU"
+  local cores model mhz
+  cores="$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo '?')"
+  model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo '?')"
+  mhz="$(grep -m1 'cpu MHz' /proc/cpuinfo 2>/dev/null | awk '{print $4}' || echo '?')"
+  JSON_CPU_CORES="$cores"
+  JSON_CPU_MODEL="$model"
+  append "${C_BOLD}Cores:${C_RESET}  $cores  —  $model @ ${mhz} MHz"
+  if have lscpu; then
+    append "${C_DIM}lscpu:${C_RESET}"
+    while IFS= read -r line; do append "  $line"; done < <(lscpu 2>/dev/null | grep -E 'Architecture|CPU\(s\)|Thread|Core|Model name|MHz|Virtualization' || true)
+  fi
+  # cpu usage snapshot: mpstat or /proc/stat
+  if have mpstat; then
+    append "${C_DIM}mpstat (1s sample):${C_RESET}"
+    while IFS= read -r line; do append "  $line"; done < <(mpstat 1 1 2>/dev/null | tail -n +4 || true)
+  else
+    # quick /proc/stat diff
+    local s1 s2
+    s1="$(grep '^cpu ' /proc/stat 2>/dev/null || true)"
+    sleep 0.5
+    s2="$(grep '^cpu ' /proc/stat 2>/dev/null || true)"
+    if [[ -n "$s1" && -n "$s2" ]]; then
+      append "${C_DIM}cpu stat (0.5s delta):${C_RESET} $s1 -> $s2"
+    fi
+  fi
+  # top cpu consumers
+  append "${C_DIM}Top CPU processes:${C_RESET}"
+  append "$(printf "${C_DIM}%-8s %-8s %5s %s${C_RESET}" "PID" "USER" "%CPU" "COMMAND")"
+  # capture formatted lines via helper
+  while IFS= read -r line; do append "  $line"; done < <(ps aux --sort=-%cpu 2>/dev/null | head -n $((TOP_N+1)) | awk 'NR==1{print $2" "$1" "$3" "$11} NR>1{printf "%-8s %-8s %5s %s\n",$2,$1,$3,$11}' 2>/dev/null || echo "  (ps unavailable)")
+}
+
+# ─── SECTION 3: MEMORY ──────────────────────────────────────────────────────
+render_memory() {
+  print_section "MEMORY"
+  if have free; then
+    while IFS= read -r line; do append "  $line"; done < <(free -h 2>/dev/null || free 2>/dev/null)
+  fi
+  if [[ -r /proc/meminfo ]]; then
+    local total avail swap_total swap_free mem_used_pct
+    total="$(awk '/MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    avail="$(awk '/MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    swap_total="$(awk '/SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    swap_free="$(awk '/SwapFree:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    JSON_MEM_TOTAL_KB="$total"; JSON_MEM_AVAIL_KB="$avail"; JSON_SWAP_TOTAL_KB="$swap_total"
+    if [[ "$total" -gt 0 ]]; then
+      local used=$((total - avail))
+      mem_used_pct=$(( used * 100 / total ))
+      append "  ${C_BOLD}RAM Used:${C_RESET} ${mem_used_pct}%  (${used}kB / ${total}kB, avail ${avail}kB)"
+      if [[ $DO_ALERT -eq 1 && $mem_used_pct -ge $THRESH_MEM ]]; then
+        append "  ${C_RED}✘ CRIT RAM ${mem_used_pct}% >= ${THRESH_MEM}%${C_RESET}"
+        add_alert "{\"level\":\"crit\",\"check\":\"mem\",\"msg\":\"RAM ${mem_used_pct}%\"}"
+      elif [[ $DO_ALERT -eq 1 && $mem_used_pct -ge $((THRESH_MEM-10)) ]]; then
+        append "  ${C_YELLOW}⚠ WARN RAM ${mem_used_pct}% near ${THRESH_MEM}%${C_RESET}"
+        add_alert "{\"level\":\"warn\",\"check\":\"mem\",\"msg\":\"RAM ${mem_used_pct}%\"}"
+      fi
+    fi
+    if [[ "$swap_total" -gt 0 ]]; then
+      local swap_used=$((swap_total - swap_free))
+      local swap_pct=$(( swap_used * 100 / swap_total ))
+      append "  ${C_BOLD}Swap Used:${C_RESET} ${swap_pct}%  (${swap_used}kB / ${swap_total}kB)"
+      if [[ $DO_ALERT -eq 1 && $swap_pct -ge $THRESH_SWAP ]]; then
+        append "  ${C_YELLOW}⚠ Swap ${swap_pct}% >= ${THRESH_SWAP}%${C_RESET}"
+        add_alert "{\"level\":\"warn\",\"check\":\"swap\",\"msg\":\"swap ${swap_pct}%\"}"
+      fi
+    fi
+    append "${C_DIM}/proc/meminfo highlights:${C_RESET}"
+    while IFS= read -r l; do append "  $l"; done < <(grep -E 'MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Dirty|Slab' /proc/meminfo 2>/dev/null || true)
+  fi
+  if have vmstat; then
+    append "${C_DIM}vmstat -s (summary):${C_RESET}"
+    while IFS= read -r l; do append "  $l"; done < <(vmstat -s 2>/dev/null | head -n 12 || true)
+  fi
+  # top mem consumers
+  append "${C_DIM}Top MEM processes:${C_RESET}"
+  while IFS= read -r line; do append "  $line"; done < <(ps aux --sort=-%mem 2>/dev/null | head -n $((TOP_N+1)) | awk 'NR==1{print $2" "$1" "$4" "$6" "$11} NR>1{printf "%-8s %-8s %5s%% %8sKB %s\n",$2,$1,$4,$6,$11}' 2>/dev/null || echo "  (ps unavailable)")
+}
+
+# ─── SECTION 4: DISK — CATEGORIZED TABLES ──────────────────────────────────
+render_disk() {
+  print_section "DISK — Filesystems"
+  if have df; then
+    # header
+    append "${C_BOLD}$(printf "%-20s %-10s %8s %8s %8s %5s %s" "Filesystem" "Type" "Size" "Used" "Avail" "Use%" "Mounted")${C_RESET}"
+    hr
+    while IFS= read -r line; do
+      # color by threshold
+      local usep mp
+      usep="$(echo "$line" | awk '{print $(NF-1)}' | tr -d '%')"
+      mp="$(echo "$line" | awk '{print $NF}')"
+      if [[ "$usep" =~ ^[0-9]+$ ]] && [[ $DO_ALERT -eq 1 ]] && [[ "$usep" -ge "$THRESH_DISK" ]]; then
+        append "${C_RED}$line${C_RESET}"
+        add_alert "{\"level\":\"crit\",\"check\":\"disk\",\"msg\":\"$mp ${usep}%\"}"
+      elif [[ "$usep" =~ ^[0-9]+$ ]] && [[ $DO_ALERT -eq 1 ]] && [[ "$usep" -ge $((THRESH_DISK-10)) ]]; then
+        append "${C_YELLOW}$line${C_RESET}"
+        add_alert "{\"level\":\"warn\",\"check\":\"disk\",\"msg\":\"$mp ${usep}%\"}"
+      else
+        append "$line"
+      fi
+    done < <(df -hT -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | tail -n +2 | awk '{printf "%-20s %-10s %8s %8s %8s %5s %s\n",$1,$2,$3,$4,$5,$6,$7}' || df -h 2>/dev/null | tail -n +2)
+    # also capture for JSON (raw)
+    JSON_DF_JSON="$(df -hT 2>/dev/null | tail -n +2 | jq -R -s -c 'split("\n")|map(select(length>0))' 2>/dev/null || echo '[]')"
+  fi
+
+  print_section "DISK — Inodes"
+  if have df; then
+    append "${C_BOLD}$(printf "%-20s %10s %10s %10s %5s %s" "Filesystem" "Inodes" "IUsed" "IFree" "IUse%" "Mounted")${C_RESET}"
+    hr
+    while IFS= read -r line; do append "$line"; done < <(df -i 2>/dev/null | tail -n +2 | awk '{printf "%-20s %10s %10s %10s %5s %s\n",$1,$2,$3,$4,$5,$6}' | head -n 20)
+  fi
+
+  print_section "DISK — Block Devices"
+  if have lsblk; then
+    while IFS= read -r line; do append "  $line"; done < <(lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL 2>/dev/null || lsblk 2>/dev/null)
+    JSON_LSBLK_JSON="$(lsblk -J 2>/dev/null || echo '{}')"
+  else
+    append "  (lsblk not found)"
+  fi
+
+  # ── Top directories (common high space) ──
+  print_section "DISK — Top ${TOP_N} Largest Directories (categorized)"
+  append "${C_BOLD}Top-level (du -sh /* — timeout 12s):${C_RESET}"
+  append "${C_DIM}$(printf "%-10s %s" "Size" "Directory")${C_RESET}"
+  hr
+  local du_out
+  if have timeout; then
+    du_out="$(timeout 12 bash -c 'du -sh /* 2>/dev/null | sort -rh | head -n '"$TOP_N" 2>&1 || echo "  (du timed out — partial)")"
+    # if still empty due to timeout, fallback to df-like view
+    if [[ -z "$du_out" ]]; then du_out="  (timeout after 12s — showing df fallback)"; fi
+  else
+    du_out="$(du -sh /* 2>/dev/null | sort -rh | head -n "$TOP_N" || echo "  (du failed)")"
+  fi
+  while IFS= read -r line; do append "  $line"; done <<< "$du_out"
+
+  append ""
+  append "${C_BOLD}Categorized breakdown (timeout 6s each):${C_RESET}"
+  # Only scan high-value dirs that are likely to be large but not huge like /usr
+  local cats=(
+    "/home:Home dirs"
+    "/var:Var (/var/log, /var/cache)"
+    "/tmp:Tmp"
+    "/opt:Opt"
+  )
+  for entry in "${cats[@]}"; do
+    local path="${entry%%:*}"
+    local label="${entry#*:}"
+    if [[ -d "$path" ]]; then
+      append "  ${C_CYAN}${label} (${path}):${C_RESET}"
+      local sub
+      if have timeout; then
+        sub="$(timeout 6 bash -c "du -sh \"$path\"/* 2>/dev/null | sort -rh | head -n $TOP_N" 2>&1 || echo "    (timed out or no access)")"
+      else
+        sub="$(du -sh "$path"/* 2>/dev/null | sort -rh | head -n "$TOP_N" || du -sh "$path" 2>/dev/null || echo "    (no access)")"
+      fi
+      while IFS= read -r line; do append "    $line"; done <<< "$sub"
+    fi
+  done
+  # Light /usr check: only top 2 levels without recursive deep scan, quick
+  if [[ -d /usr ]]; then
+    append "  ${C_CYAN}Usr (sample):${C_RESET}"
+    local usr_sub
+    usr_sub="$(du -sh /usr/* 2>/dev/null | sort -rh | head -n 5 || echo "    (no access)")"
+    # run with timeout quickly; if hangs fallback
+    if have timeout; then usr_sub="$(timeout 5 bash -c 'du -sh /usr/* 2>/dev/null | sort -rh | head -n 5' 2>&1 || echo "    (timed out)")"; fi
+    while IFS= read -r line; do append "    $line"; done <<< "$usr_sub"
+  fi
+
+  # ── Top largest FILES — optimized: scan only high-yield dirs ──
+  print_section "DISK — Top ${TOP_N} Largest Files (fast scan, 8s total)"
+  append "${C_DIM}$(printf "%-10s %s" "Size" "Path")${C_RESET}"
+  hr
+  local tmp_find="/tmp/sysh-find-$$.tmp"
+  : > "$tmp_find" 2>/dev/null || true
+  # Strategy: scan /home, /var, /tmp with shorter timeout; avoid whole / scan which is too slow (69G)
+  if have timeout; then
+    # Use ionice/nice if available to reduce impact
+    local find_cmd="find /home /var /tmp -xdev -type f -printf '%s|%p\n' 2>/dev/null | sort -t'|' -k1 -nr | head -n $TOP_N | while IFS='|' read -r sz p; do printf '%10s  %s\n' \"\$(numfmt --to=iec \$sz 2>/dev/null || echo \${sz}B)\" \"\$p\"; done"
+    if have ionice; then
+      timeout 8 ionice -c3 nice -n 19 bash -c "$find_cmd" > "$tmp_find" 2>/dev/null || echo "  (scan partial after 8s)" > "$tmp_find"
+    else
+      timeout 8 bash -c "$find_cmd" > "$tmp_find" 2>/dev/null || echo "  (scan timed out — partial)" > "$tmp_find"
+    fi
+    # fallback shallow root if still empty: maxdepth 3 quick
+    if [[ ! -s "$tmp_find" ]] || grep -q "partial" "$tmp_find"; then
+      local shallow="/tmp/sysh-find2-$$.tmp"
+      timeout 4 bash -c "find / -maxdepth 3 -xdev -type f -printf '%s|%p\n' 2>/dev/null | sort -t'|' -k1 -nr | head -n $TOP_N | while IFS='|' read -r sz p; do printf '%10s  %s\n' \"\$(numfmt --to=iec \$sz 2>/dev/null || echo \${sz}B)\" \"\$p\"; done" > "$shallow" 2>/dev/null || true
+      if [[ -s "$shallow" ]]; then cat "$shallow" >> "$tmp_find"; fi
+      rm -f "$shallow" 2>/dev/null || true
+    fi
+  else
+    find /home -maxdepth 4 -type f -printf '%s|%p\n' 2>/dev/null | sort -t'|' -k1 -nr | head -n "$TOP_N" | while IFS='|' read -r sz p; do
+      hr_sz="$(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B")"
+      printf '%10s  %s\n' "$hr_sz" "$p" >> "$tmp_find"
+    done
+  fi
+  if [[ -s "$tmp_find" ]]; then
+    while IFS= read -r line; do append "  $line"; done < "$tmp_find"
+  else
+    append "  (no files found or scan skipped — try sudo sysh)"
+  fi
+  rm -f "$tmp_find" 2>/dev/null || true
+  append ""
+  append "${C_DIM}Hint: for full FS scan run: sudo find / -type f -printf '%s %p\n' | sort -nr | head${C_RESET}"
+
+  # ── Top programs/packages ──
+  print_section "DISK — Top ${TOP_N} Programs/Packages by Installed Size"
+  append "${C_DIM}$(printf "%-10s %s" "Size" "Package")${C_RESET}"
+  hr
+  if have dpkg-query; then
+    while IFS= read -r line; do append "  $line"; done < <(dpkg-query -Wf '${Installed-Size}\t${Package}\n' 2>/dev/null | sort -rn | head -n "$TOP_N" | while read -r kb pkg; do printf "%10s  %s\n" "$(numfmt --to=iec $((kb*1024)) 2>/dev/null || echo "${kb}K")" "$pkg"; done || echo "  (dpkg-query failed)")
+  elif have rpm; then
+    while IFS= read -r line; do append "  $line"; done < <(rpm -qa --queryformat '%{SIZE} %{NAME}\n' 2>/dev/null | sort -rn | head -n "$TOP_N" | while read -r sz pkg; do printf "%10s  %s\n" "$(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B")" "$pkg"; done)
+  elif have pacman; then
+    while IFS= read -r line; do append "  $line"; done < <(pacman -Qi 2>/dev/null | awk '/^Name/{n=$3} /^Installed Size/{s=$4$5; print s,n}' | sort -rh | head -n "$TOP_N")
+  else
+    append "  (no dpkg/rpm/pacman found) — showing /usr/bin largest binaries:"
+    find /usr/bin -type f -printf '%s|%p\n' 2>/dev/null | sort -t'|' -k1 -nr | head -n "$TOP_N" | while IFS='|' read -r sz p; do append "  $(printf '%10s  %s' "$(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B")" "$p")"; done
+  fi
+  # snap/flatpak — wrapped with timeout to avoid hangs
+  if have snap; then
+    append ""
+    append "${C_BOLD}Snap packages:${C_RESET}"
+    if have timeout; then
+      while IFS= read -r line; do append "  $line"; done < <(timeout 5 snap list 2>/dev/null | head -n $((TOP_N+1)) || echo "  (snap timed out / no snaps)")
+      timeout 5 bash -c 'du -sh /var/lib/snapd/snaps/* 2>/dev/null | sort -rh | head -n '"$TOP_N" | while IFS= read -r l; do append "  $l"; done || true
+    else
+      while IFS= read -r line; do append "  $line"; done < <(snap list 2>/dev/null | head -n $((TOP_N+1)) || echo "  (snap failed)")
+      du -sh /var/lib/snapd/snaps/* 2>/dev/null | sort -rh | head -n "$TOP_N" | while IFS= read -r l; do append "  $l"; done || true
+    fi
+  fi
+  if have flatpak; then
+    append ""
+    append "${C_BOLD}Flatpak:${C_RESET}"
+    if have timeout; then
+      timeout 5 flatpak list --app --columns=name,size 2>/dev/null | head -n "$TOP_N" | while IFS= read -r l; do append "  $l"; done || echo "  (flatpak timed out)" | while IFS= read -r l; do append "  $l"; done
+      timeout 5 bash -c 'du -sh /var/lib/flatpak/* 2>/dev/null | sort -rh | head -n 5' | while IFS= read -r l; do append "  $l"; done || true
+    else
+      flatpak list --app --columns=name,size 2>/dev/null | head -n "$TOP_N" | while IFS= read -r l; do append "  $l"; done || true
+      du -sh /var/lib/flatpak/* 2>/dev/null | sort -rh | head -n 5 | while IFS= read -r l; do append "  $l"; done || true
+    fi
+  fi
+
+  # ── Docker ──
+  print_section "DISK — Docker"
+  if have docker; then
+    if have timeout; then
+      if timeout 4 docker info >/dev/null 2>&1; then
+        append "${C_BOLD}docker system df:${C_RESET}"
+        while IFS= read -r line; do append "  $line"; done < <(timeout 5 docker system df 2>/dev/null || echo "  (docker system df timed out)")
+        append ""
+        append "${C_BOLD}Top ${TOP_N} images by size:${C_RESET}"
+        append "${C_DIM}$(printf "%-30s %-15s %10s" "Repository" "Tag" "Size")${C_RESET}"
+        hr
+        while IFS= read -r line; do append "  $line"; done < <(timeout 5 docker images --format '{{.Repository}}|{{.Tag}}|{{.Size}}' 2>/dev/null | head -n "$TOP_N" | awk -F'|' '{printf "%-30s %-15s %10s\n",$1,$2,$3}' || echo "  (no images / timed out)")
+        append ""
+        append "${C_BOLD}Containers (size):${C_RESET}"
+        while IFS= read -r line; do append "  $line"; done < <(timeout 5 docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Size}}\t{{.Status}}' 2>/dev/null | head -n $((TOP_N+1)) || echo "  (no containers / timed out)")
+        append ""
+        append "${C_BOLD}Volumes:${C_RESET}"
+        if have timeout; then timeout 5 docker volume ls 2>/dev/null | head -n $((TOP_N+1)) | while IFS= read -r l; do append "  $l"; done || append "  (docker volume ls timed out)"; else docker volume ls 2>/dev/null | head -n $((TOP_N+1)) | while IFS= read -r l; do append "  $l"; done || true; fi
+        if [[ -d /var/lib/docker ]]; then
+          append "  ${C_DIM}/var/lib/docker usage:${C_RESET} $(timeout 5 du -sh /var/lib/docker 2>/dev/null || echo 'timed out')"
+        fi
+      else
+        append "  Docker installed but daemon not reachable (timeout 4s)"
+      fi
+    else
+      if docker info >/dev/null 2>&1; then
+        append "${C_BOLD}docker system df:${C_RESET}"
+        while IFS= read -r line; do append "  $line"; done < <(docker system df 2>/dev/null || echo "  (docker system df failed)")
+        append ""
+        append "${C_BOLD}Top ${TOP_N} images by size:${C_RESET}"
+        append "${C_DIM}$(printf "%-30s %-15s %10s" "Repository" "Tag" "Size")${C_RESET}"
+        hr
+        while IFS= read -r line; do append "  $line"; done < <(docker images --format '{{.Repository}}|{{.Tag}}|{{.Size}}' 2>/dev/null | head -n "$TOP_N" | awk -F'|' '{printf "%-30s %-15s %10s\n",$1,$2,$3}' || echo "  (no images)")
+        append ""
+        append "${C_BOLD}Containers (size):${C_RESET}"
+        while IFS= read -r line; do append "  $line"; done < <(docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Size}}\t{{.Status}}' 2>/dev/null | head -n $((TOP_N+1)) || echo "  (no containers)")
+        append ""
+        append "${C_BOLD}Volumes:${C_RESET}"
+        docker volume ls 2>/dev/null | head -n $((TOP_N+1)) | while IFS= read -r l; do append "  $l"; done
+        if [[ -d /var/lib/docker ]]; then
+          append "  ${C_DIM}/var/lib/docker usage:${C_RESET} $(du -sh /var/lib/docker 2>/dev/null || echo '?')"
+        fi
+      else
+        append "  Docker installed but daemon not reachable"
+      fi
+    fi
+  else
+    append "  (docker not installed)"
+  fi
+
+  # ── I/O stats ──
+  if have iostat; then
+    print_section "DISK — I/O (iostat)"
+    while IFS= read -r line; do append "  $line"; done < <(iostat -xz 1 1 2>/dev/null | tail -n +4 || echo "  (iostat failed)")
+  elif [[ -r /proc/diskstats ]]; then
+    print_section "DISK — I/O (/proc/diskstats snapshot)"
+    while IFS= read -r line; do append "  $line"; done < <(head -n 10 /proc/diskstats 2>/dev/null)
+  fi
+}
+
+# ─── SECTION 5: NETWORK ─────────────────────────────────────────────────────
+render_network() {
+  print_section "NETWORK"
+  if have ip; then
+    append "${C_BOLD}Interfaces (ip -br addr):${C_RESET}"
+    while IFS= read -r line; do append "  $line"; done < <(ip -br addr 2>/dev/null || ip addr 2>/dev/null | head -n 40)
+    append "${C_BOLD}Link stats (ip -s link):${C_RESET}"
+    while IFS= read -r line; do append "  $line"; done < <(ip -s link 2>/dev/null | head -n 40)
+  elif have ifconfig; then
+    while IFS= read -r line; do append "  $line"; done < <(ifconfig 2>/dev/null | head -n 50)
+  fi
+  if have ss; then
+    append "${C_BOLD}Sockets summary (ss -s):${C_RESET}"
+    while IFS= read -r line; do append "  $line"; done < <(ss -s 2>/dev/null)
+    append "${C_BOLD}Listening ports (ss -tuln):${C_RESET}"
+    while IFS= read -r line; do append "  $line"; done < <(ss -tuln 2>/dev/null | head -n 20)
+  elif have netstat; then
+    while IFS= read -r line; do append "  $line"; done < <(netstat -tuln 2>/dev/null | head -n 20)
+  fi
+  if [[ -r /proc/net/dev ]]; then
+    append "${C_BOLD}/proc/net/dev:${C_RESET}"
+    while IFS= read -r line; do append "  $line"; done < <(cat /proc/net/dev 2>/dev/null | head -n 20)
+  fi
+  append "${C_BOLD}Connectivity:${C_RESET}"
+  if have ping; then
+    local ping_out
+    ping_out="$(ping -c1 -W2 8.8.8.8 2>&1 | head -n 5 || echo "ping failed")"
+    while IFS= read -r line; do append "  $line"; done <<< "$ping_out"
+    ping_out="$(ping -c1 -W2 1.1.1.1 2>&1 | head -n 3 | tail -n 1 || true)"
+    [[ -n "$ping_out" ]] && append "  1.1.1.1: $ping_out"
+  fi
+  if have ss; then
+    local est
+    est="$(ss -tun 2>/dev/null | wc -l | tr -d ' ' || echo '?')"
+    append "  Established/total sockets: $est"
+  fi
+}
+
+# ─── SECTION 6: PROCESSES ───────────────────────────────────────────────────
+render_processes() {
+  print_section "PROCESSES"
+  local total_zombie total_procs threads
+  total_procs="$(ps aux 2>/dev/null | tail -n +2 | wc -l | tr -d ' ' || echo '?')"
+  total_zombie="$(ps aux 2>/dev/null | awk '$8 ~ /^Z/ {c++} END{print c+0}')"
+  threads="$(ps -eLf 2>/dev/null | wc -l | tr -d ' ' || echo '?')"
+  append "${C_BOLD}Counts:${C_RESET}  $total_procs processes, $threads threads, $total_zombie zombies"
+  if [[ "$total_zombie" -gt 0 && $DO_ALERT -eq 1 ]]; then
+    append "  ${C_YELLOW}⚠ $total_zombie zombie process(es)${C_RESET}"
+    add_alert "{\"level\":\"warn\",\"check\":\"zombie\",\"msg\":\"$total_zombie zombies\"}"
+  fi
+  append "${C_BOLD}Top ${TOP_N} by CPU:${C_RESET}"
+  ps aux --sort=-%cpu 2>/dev/null | head -n $((TOP_N+1)) | while IFS= read -r l; do append "  $l"; done
+  append "${C_BOLD}Top ${TOP_N} by MEM:${C_RESET}"
+  ps aux --sort=-%mem 2>/dev/null | head -n $((TOP_N+1)) | while IFS= read -r l; do append "  $l"; done
+}
+
+# ─── SECTION 7: SERVICES ────────────────────────────────────────────────────
+render_services() {
+  print_section "SERVICES (systemd)"
+  if have systemctl; then
+    local sys_state
+    sys_state="$(systemctl is-system-running 2>/dev/null || echo '?')"
+    append "${C_BOLD}System state:${C_RESET} $sys_state"
+    if [[ "$sys_state" == "degraded" && $DO_ALERT -eq 1 ]]; then
+      append "  ${C_YELLOW}⚠ System degraded${C_RESET}"
+      add_alert "{\"level\":\"warn\",\"check\":\"systemd\",\"msg\":\"degraded\"}"
+    fi
+    append "${C_BOLD}Failed units:${C_RESET}"
+    local failed
+    failed="$(systemctl --failed --no-pager 2>/dev/null || echo "  (no systemd or no failed units)")"
+    while IFS= read -r line; do append "  $line"; done <<< "$failed"
+    append "${C_BOLD}Recent service failures (last 5):${C_RESET}"
+    systemctl --failed --no-pager 2>/dev/null | tail -n +2 | head -n 5 | while IFS= read -r l; do append "  $l"; done
+  else
+    append "  (systemctl not found — non-systemd system)"
+    if have service; then service --status-all 2>&1 | head -n 20 | while IFS= read -r l; do append "  $l"; done; fi
+  fi
+}
+
+# ─── SECTION 8: LOGS ────────────────────────────────────────────────────────
+render_logs() {
+  print_section "LOGS (last errors)"
+  if have journalctl; then
+    append "${C_BOLD}journalctl -p 3 (errors) last 10:${C_RESET}"
+    journalctl -p 3 --no-pager -n 10 2>/dev/null | while IFS= read -r l; do append "  $l"; done || append "  (journalctl not accessible — try sudo)"
+  fi
+  if have dmesg; then
+    append "${C_BOLD}dmesg --level err,warn tail 10:${C_RESET}"
+    dmesg --level=err,warn 2>/dev/null | tail -n 10 | while IFS= read -r l; do append "  $l"; done || dmesg 2>/dev/null | tail -n 10 | while IFS= read -r l; do append "  $l"; done || append "  (dmesg not accessible)"
+  fi
+  append "${C_BOLD}Auth failures (last 5):${C_RESET}"
+  if [[ -r /var/log/auth.log ]]; then
+    grep -i "fail" /var/log/auth.log 2>/dev/null | tail -n 5 | while IFS= read -r l; do append "  $l"; done || append "  (no fails recent)"
+  elif [[ -r /var/log/secure ]]; then
+    grep -i "fail" /var/log/secure 2>/dev/null | tail -n 5 | while IFS= read -r l; do append "  $l"; done || append "  (no fails)"
+  else
+    append "  (no auth.log/secure readable)"
+  fi
+}
+
+# ─── SECTION 9: SENSORS ─────────────────────────────────────────────────────
+render_sensors() {
+  print_section "SENSORS / THERMAL / POWER"
+  if have sensors; then
+    append "${C_BOLD}sensors:${C_RESET}"
+    sensors 2>/dev/null | while IFS= read -r l; do append "  $l"; done || append "  (sensors failed)"
+  else
+    append "  (lm-sensors not installed — apt install lm-sensors)"
+  fi
+  if compgen -G "/sys/class/thermal/thermal_zone*/temp" >/dev/null 2>&1; then
+    append "${C_BOLD}Thermal zones:${C_RESET}"
+    for f in /sys/class/thermal/thermal_zone*/temp; do
+      local t raw
+      raw="$(cat "$f" 2>/dev/null || echo 0)"
+      t="$(awk "BEGIN{printf \"%.1f°C\", $raw/1000}" 2>/dev/null || echo "${raw}mC")"
+      local zone
+      zone="$(cat "${f%/temp}/type" 2>/dev/null || echo "$(basename "$(dirname "$f")")")"
+      append "  $zone: $t"
+      if [[ $DO_ALERT -eq 1 ]]; then
+        local tc
+        tc="$(awk "BEGIN{print ($raw/1000)}" 2>/dev/null || echo 0)"
+        if awk "BEGIN{exit !($tc > 85)}" 2>/dev/null; then
+          append "    ${C_RED}✘ CRIT temp $t > 85°C${C_RESET}"
+          add_alert "{\"level\":\"crit\",\"check\":\"thermal\",\"msg\":\"$zone $t\"}"
+        fi
+      fi
+    done
+  fi
+  if have upower; then
+    append "${C_BOLD}Battery (upower):${C_RESET}"
+    upower -i "$(upower -e 2>/dev/null | grep -i battery | head -n1)" 2>/dev/null | grep -E 'state|percentage|time to' | while IFS= read -r l; do append "  $l"; done || append "  (no battery)"
+  elif [[ -d /sys/class/power_supply ]]; then
+    for bat in /sys/class/power_supply/BAT*; do
+      [[ -d "$bat" ]] || continue
+      append "  $(basename "$bat"): $(cat "$bat/capacity" 2>/dev/null || echo '?')% $(cat "$bat/status" 2>/dev/null || echo '')"
+    done
+  fi
+  if have nvidia-smi; then
+    append "${C_BOLD}nvidia-smi:${C_RESET}"
+    nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv 2>/dev/null | while IFS= read -r l; do append "  $l"; done
+  fi
+}
+
+# ─── SECTION 10: VIRT — Thin-provisioned virtual images ─────────────────────
+render_virt() {
+  if [[ $DO_VIRT -eq 0 ]]; then
+    return
+  fi
+  print_section "VIRT — Thin-provisioned Images & Overcommit Calculation"
+  append "${C_DIM}Scan: *.qcow2 *.qcow *.vdi *.vmdk *.vhd *.vhdx *.img (+ LVM thin pools) — timeout-guarded${C_RESET}"
+  append "${C_DIM}Calc: actual_left = host_free - total_remaining  (remaining = virtual - actual)${C_RESET}"
+  hr
+
+  local host_free=0
+  # host free bytes on root fs (change if needed: primary mount /)
+  if have df; then
+    host_free="$(df -B1 / 2>/dev/null | tail -n 1 | awk '{print $4}' 2>/dev/null || echo 0)"
+    # fallback via output flag
+    if [[ ! "$host_free" =~ ^[0-9]+$ ]]; then
+      host_free="$(df -B1 --output=avail / 2>/dev/null | tail -n 1 | tr -d ' ' || echo 0)"
+    fi
+  fi
+  VIRT_HOST_FREE="$host_free"
+  local host_free_h
+  host_free_h="$(numfmt --to=iec "$host_free" 2>/dev/null || echo "${host_free}B")"
+  append "${C_BOLD}Host free (df -B1 /):${C_RESET} ${host_free_h}  (${host_free} bytes) → this is 'leftspace' before virt"
+
+  # ── find virt images ──
+  local tmp_list="/tmp/sysh-virt-$$.list"
+  local tmp_data="/tmp/sysh-virt-$$.data"
+  : > "$tmp_list" 2>/dev/null || true
+  : > "$tmp_data" 2>/dev/null || true
+
+  local search_dirs=(/home /var/lib/libvirt /var/lib/qemu /var/lib/one /opt /srv /var/log)
+  # Filter existing dirs
+  local existing=()
+  for d in "${search_dirs[@]}"; do [[ -d "$d" ]] && existing+=("$d"); done
+  # also add /var/tmp if exists
+  [[ -d /var/tmp ]] && existing+=("/var/tmp")
+
+  # Build find command: search only those dirs, limit depth top 8 to avoid huge scan? But qcow2 deeper is okay.
+  # Use ionice/nice if available to be nice.
+  local find_expr=' -type f \( -iname "*.qcow2" -o -iname "*.qcow" -o -iname "*.vdi" -o -iname "*.vmdk" -o -iname "*.vhd" -o -iname "*.vhdx" -o -iname "*.img" \) -printf "%p\n" '
+  local find_cmd="find ${existing[*]} -xdev $find_expr 2>/dev/null | head -n 500"
+  # head 500 to limit; user can increase TOP_N but we cap search to prevent explosion; we later sort top by virtual size
+  if have timeout; then
+    if have ionice; then
+      timeout 10 ionice -c3 nice -n 19 bash -c "$find_cmd" > "$tmp_list" 2>/dev/null || echo "  (virt find timed out after 10s — partial list)" > "$tmp_list"
+    else
+      timeout 10 bash -c "$find_cmd" > "$tmp_list" 2>/dev/null || echo "  (virt find timed out)" > "$tmp_list"
+    fi
+  else
+    bash -c "$find_cmd" > "$tmp_list" 2>/dev/null || true
+  fi
+
+  # Also add quick check for bare /var/lib/libvirt/images via sudo if permission denied?
+  if [[ ! -s "$tmp_list" ]]; then
+    append "  (no virt images found in ${existing[*]})"
+  else
+    # Filter out partial message line
+    grep -v "timed out" "$tmp_list" > "${tmp_list}.clean" 2>/dev/null || true
+    mv "${tmp_list}.clean" "$tmp_list" 2>/dev/null || true
+    local count
+    count="$(wc -l < "$tmp_list" | tr -d ' ')"
+    append "  Found ${count} candidate image(s) (capped 500) — inspect top ${TOP_N} by virtual size:"
+  fi
+
+  # Header for table
+  append ""
+  append "${C_BOLD}$(printf "%-50s %-7s %10s %10s %10s %6s" "Path" "Fmt" "Virtual" "Actual" "Remain" "Thin%")${C_RESET}"
+  hr
+
+  local total_v=0 total_a=0 total_r=0
+  local images_found=0
+
+  # Process each image — use timeout per qemu-img to avoid hang on huge files
+  while IFS= read -r img; do
+    [[ -z "$img" ]] && continue
+    [[ ! -f "$img" ]] && continue
+    local virt=0 actual=0 fmt="?"
+    local qout
+    if have qemu-img; then
+      if have timeout; then
+        qout="$(timeout 5 qemu-img info --output=json "$img" 2>/dev/null || echo "")"
+      else
+        qout="$(qemu-img info --output=json "$img" 2>/dev/null || echo "")"
+      fi
+      if [[ -n "$qout" ]]; then
+        if have python3; then
+          read -r virt actual fmt <<< "$(echo "$qout" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("{} {} {}".format(d.get("virtual-size",0), d.get("actual-size",0), d.get("format","?")))' 2>/dev/null || echo "0 0 ?")"
+        elif have jq; then
+          virt="$(echo "$qout" | jq -r '.["virtual-size"] // 0' 2>/dev/null || echo 0)"
+          actual="$(echo "$qout" | jq -r '.["actual-size"] // 0' 2>/dev/null || echo 0)"
+          fmt="$(echo "$qout" | jq -r '.format // "?"' 2>/dev/null || echo "?")"
+        else
+          # fallback grep
+          virt="$(echo "$qout" | grep -o '"virtual-size": [0-9]*' | head -1 | grep -o '[0-9]*' || echo 0)"
+          actual="$(echo "$qout" | grep -o '"actual-size": [0-9]*' | head -1 | grep -o '[0-9]*' || echo 0)"
+          fmt="$(echo "$qout" | grep -o '"format": "[^"]*"' | head -1 | cut -d'"' -f4 || echo "?")"
+        fi
+      fi
+    fi
+    # fallback if qemu failed or zero: use stat/du
+    if [[ "$virt" == "0" || -z "$virt" ]]; then
+      # virtual = apparent size, actual = disk usage
+      local apparent disk
+      apparent="$(stat -c %s "$img" 2>/dev/null || echo 0)"
+      # du -B1 actual blocks on disk
+      disk="$(du -B1 "$img" 2>/dev/null | awk '{print $1}' || echo "$apparent")"
+      virt="$apparent"
+      actual="$disk"
+      fmt="${fmt:-raw}"
+    fi
+    # sanitize numeric
+    if ! [[ "$virt" =~ ^[0-9]+$ ]]; then virt=0; fi
+    if ! [[ "$actual" =~ ^[0-9]+$ ]]; then actual=0; fi
+    local remain=$((virt - actual))
+    if [[ $remain -lt 0 ]]; then remain=0; fi
+    local thin=0
+    if [[ $virt -gt 0 ]]; then thin=$(( (remain * 100) / virt )); fi
+
+    total_v=$((total_v + virt))
+    total_a=$((total_a + actual))
+    total_r=$((total_r + remain))
+    images_found=$((images_found + 1))
+
+    # stash for sorting top: use temp data line: virt|actual|remain|thin|fmt|path
+    printf "%s|%s|%s|%s|%s|%s\n" "$virt" "$actual" "$remain" "$thin" "$fmt" "$img" >> "$tmp_data"
+
+  done < "$tmp_list"
+
+  # sort by virtual size descending and show TOP_N
+  if [[ -s "$tmp_data" ]]; then
+    local sorted="/tmp/sysh-virt-sorted-$$.txt"
+    sort -t'|' -k1 -nr "$tmp_data" | head -n "$TOP_N" > "$sorted" 2>/dev/null || cp "$tmp_data" "$sorted"
+    while IFS='|' read -r v a r thin fmt path; do
+      local vh ah rh
+      vh="$(numfmt --to=iec "$v" 2>/dev/null || echo "${v}B")"
+      ah="$(numfmt --to=iec "$a" 2>/dev/null || echo "${a}B")"
+      rh="$(numfmt --to=iec "$r" 2>/dev/null || echo "${r}B")"
+      # truncate path if too long
+      local disp="$path"
+      if [[ ${#disp} -gt 50 ]]; then disp="…${disp: -49}"; fi
+      local pct="${thin}%"
+      # color thin% if high
+      local line
+      line="$(printf "%-50s %-7s %10s %10s %10s %6s" "$disp" "$fmt" "$vh" "$ah" "$rh" "$pct")"
+      if [[ $thin -ge 80 ]]; then
+        append "${C_YELLOW}${line}${C_RESET}"
+      else
+        append "  ${line}"
+      fi
+    done < "$sorted"
+    rm -f "$sorted" 2>/dev/null || true
+  else
+    append "  (no parsable images — all raw?)"
+  fi
+
+  # ── LVM thin pools (if any) ──
+  append ""
+  append "${C_BOLD}LVM thin pools (lvs):${C_RESET}"
+  local lvs_found=0
+  if have lvs; then
+    local lvs_out
+    if have timeout; then
+      lvs_out="$(timeout 4 lvs --units b --reportformat json 2>&1 || timeout 4 sudo -n lvs --units b --reportformat json 2>&1 || echo "")"
+    else
+      lvs_out="$(lvs --units b --reportformat json 2>&1 || sudo -n lvs --units b --reportformat json 2>&1 || echo "")"
+    fi
+    if echo "$lvs_out" | grep -q '"lv_name"'; then
+      lvs_found=1
+      # crude parse: show via python
+      if have python3; then
+        echo "$lvs_out" | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    for rep in d.get("report",[]):
+        for vg in rep.get("vg",[]):
+            for lv in vg.get("lv",[]):
+                name=lv.get("lv_name","?")
+                size=lv.get("lv_size","?")
+                pool=lv.get("pool_lv","")
+                data_pct=lv.get("data_percent","")
+                print(f"  {name:20} size={size} pool={pool} data%={data_pct}")
+except Exception as e:
+    print(f"  (parse err {e})")
+' 2>/dev/null | while IFS= read -r l; do append "$l"; done
+        # also sum pools for calc?
+        # For virt calc, thin pool overcommit: total lv_size vs data
+        local thin_total
+        thin_total="$(echo "$lvs_out" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+tot=0
+for rep in d.get("report",[]):
+    for vg in rep.get("vg",[]):
+        for lv in vg.get("lv",[]):
+            # lv_size like "10737418240B"
+            s=lv.get("lv_size","0")
+            try:
+                tot+=int(s.rstrip("B"))
+            except: pass
+print(tot)
+' 2>/dev/null || echo 0)"
+        if [[ "$thin_total" -gt 0 ]]; then
+          local th_h
+          th_h="$(numfmt --to=iec "$thin_total" 2>/dev/null || echo "${thin_total}B")"
+          append "  Total LVM LV size: $th_h (adds to virt pressure — not yet subtracted; see calc below if needed)"
+        fi
+      else
+        echo "$lvs_out" | head -n 20 | while IFS= read -r l; do append "  $l"; done
+      fi
+    else
+      append "  (no LVM thin pools or permission denied — try sudo lvs)"
+    fi
+  else
+    append "  (lvs not installed)"
+  fi
+
+  # ── Docker overlay / storage driver note ──
+  if have docker; then
+    append ""
+    append "${C_BOLD}Docker storage:${C_RESET}"
+    local ddrv
+    ddrv="$(docker info 2>/dev/null | grep -i "Storage Driver" | head -1 || echo "  (unknown)")"
+    append "  $ddrv  (overlay2 is not thin-provisioned device-mapper; virt calc mostly qcow/vdi)"
+  fi
+
+  # ── sparse file fallback check (find sparse in /home) ──
+  # quick sample: find sparse files where blocks < size
+  append ""
+  append "${C_DIM}Sparse file hint (quick sample, blocks vs size):${C_RESET}"
+  if have timeout; then
+    timeout 4 bash -c 'find /home -xdev -type f -printf "%S %p\n" 2>/dev/null | awk '\''$1 < 1.0 {print}'\'' | head -n 5' | while IFS= read -r l; do append "  $l (sparseness <1.0)"; done || append "  (no sparse sample or timed out)"
+  else
+    find /home -xdev -type f -printf "%S %p\n" 2>/dev/null | awk '$1 < 1.0 {print}' | head -n 5 | while IFS= read -r l; do append "  $l"; done || true
+  fi
+
+  # ── Summary calculation ──
+  # total_r already computed
+  VIRT_TOTAL_VIRTUAL="$total_v"
+  VIRT_TOTAL_ACTUAL="$total_a"
+  VIRT_TOTAL_REMAINING="$total_r"
+  local actual_left=$((host_free - total_r))
+  VIRT_ACTUAL_LEFT="$actual_left"
+
+  local tv_h ta_h tr_h al_h
+  tv_h="$(numfmt --to=iec "$total_v" 2>/dev/null || echo "${total_v}B")"
+  ta_h="$(numfmt --to=iec "$total_a" 2>/dev/null || echo "${total_a}B")"
+  tr_h="$(numfmt --to=iec "$total_r" 2>/dev/null || echo "${total_r}B")"
+  al_h="$(numfmt --to=iec "$actual_left" 2>/dev/null || echo "${actual_left}B")"
+  # handle negative
+  if [[ $actual_left -lt 0 ]]; then
+    local al_abs=$(( -actual_left ))
+    local al_abs_h
+    al_abs_h="$(numfmt --to=iec "$al_abs" 2>/dev/null || echo "${al_abs}B")"
+    al_h="-$al_abs_h"
+  fi
+
+  append ""
+  hr
+  append "${C_BOLD}Calculation (as requested): actual_left = host_free - total_remaining${C_RESET}"
+  append "  host_free (leftspace)      = $host_free_h  ($host_free bytes)"
+  append "  total_virtual (sum virt)   = $tv_h  ($total_v bytes)  across $images_found images"
+  append "  total_actual (on disk)     = $ta_h  ($total_a bytes)"
+  append "  total_remaining (virt - actual) = $tr_h  ($total_r bytes)"
+  append "  ────────────────────────────────────────────"
+  if [[ $actual_left -lt 0 ]]; then
+    append "  ${C_RED}${C_BOLD}actual_left_free = $al_h  ($actual_left bytes)  ✘ OVERCOMMITTED!${C_RESET}"
+    append "  ${C_RED}  → Thin images promise ${tr_h} more than host has free. Freeing or compacting images required.${C_RESET}"
+    add_alert "{\"level\":\"crit\",\"check\":\"virt_overcommit\",\"msg\":\"actual_left $al_h overcommitted\"}"
+  elif [[ $actual_left -lt $((host_free / 10)) ]]; then
+    append "  ${C_YELLOW}actual_left_free = $al_h  ($actual_left bytes)  ⚠ LOW ( <10% host free )${C_RESET}"
+    add_alert "{\"level\":\"warn\",\"check\":\"virt_low\",\"msg\":\"actual_left $al_h\"}"
+  else
+    append "  ${C_GREEN}actual_left_free = $al_h  ($actual_left bytes)  ✔ OK${C_RESET}"
+  fi
+  hr
+  append "${C_DIM}Note: remaining is the extra that thin images could still grow to. If all images filled to virtual size at once, host would need total_remaining more.${C_RESET}"
+  append "${C_DIM}For LVM thin pools, their metadata/data overcommit is separate — check lvs data_percent above.${C_RESET}"
+
+  rm -f "$tmp_list" "$tmp_data" 2>/dev/null || true
+}
+
+# ─── SECTION 11: ALERTS SUMMARY ─────────────────────────────────────────────
+render_alerts() {
+  print_section "ALERTS SUMMARY (auto feature)"
+  if [[ $DO_ALERT -eq 0 ]]; then
+    append "  Alerts ${C_DIM}disabled${C_RESET} (--no-alert). Re-enable with --alert."
+    return
+  fi
+  if [[ ${#JSON_ALERTS[@]} -eq 0 ]]; then
+    append "  ${C_GREEN}✔ All checks OK${C_RESET}  (thresholds: disk ${THRESH_DISK}%, inode ${THRESH_INODE}%, mem ${THRESH_MEM}%, swap ${THRESH_SWAP}%)"
+  else
+    append "  ${C_YELLOW}⚠ ${#JSON_ALERTS[@]} alert(s):${C_RESET}"
+    for a in "${JSON_ALERTS[@]}"; do
+      append "    $a"
+    done
+  fi
+  # exit code logic: set global flag for later
+}
+
+# ─── JSON BUILD ─────────────────────────────────────────────────────────────
+build_json() {
+  # Build JSON manually to avoid jq dependency for core; use jq if available for pretty
+  local alerts_json
+  if [[ ${#JSON_ALERTS[@]} -eq 0 ]]; then
+    alerts_json="[]"
+  else
+    alerts_json="[$(IFS=,; echo "${JSON_ALERTS[*]}")]"
+  fi
+  # collect live values where possible (fallback if render not run e.g. --json-only)
+  local up_s load_json
+  up_s="$(uptime -s 2>/dev/null || echo "")"
+  load_json="$(cat /proc/loadavg 2>/dev/null | awk '{printf "{\"1m\":%s,\"5m\":%s,\"15m\":%s}", $1, $2, $3}' 2>/dev/null || echo '{}')"
+  # fallback populate CPU/mem if empty (json-only path)
+  if [[ -z "${JSON_CPU_CORES:-}" ]]; then JSON_CPU_CORES="$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "")"; fi
+  if [[ -z "${JSON_CPU_MODEL:-}" ]]; then JSON_CPU_MODEL="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo "")"; fi
+  if [[ -z "${JSON_MEM_TOTAL_KB:-}" ]]; then JSON_MEM_TOTAL_KB="$(awk '/MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo "")"; fi
+  if [[ -z "${JSON_MEM_AVAIL_KB:-}" ]]; then JSON_MEM_AVAIL_KB="$(awk '/MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo "")"; fi
+  if [[ -z "${JSON_SWAP_TOTAL_KB:-}" ]]; then JSON_SWAP_TOTAL_KB="$(awk '/SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo "")"; fi
+  # virt humans for JSON
+  local virt_host_h virt_actual_left_h virt_enabled
+  virt_enabled=$([[ $DO_VIRT -eq 1 ]] && echo true || echo false)
+  virt_host_h="$(numfmt --to=iec "${VIRT_HOST_FREE:-0}" 2>/dev/null || echo "${VIRT_HOST_FREE:-0}B")"
+  if [[ ${VIRT_ACTUAL_LEFT:-0} -lt 0 ]]; then
+    local _abs=$(( -VIRT_ACTUAL_LEFT ))
+    virt_actual_left_h="-$(numfmt --to=iec "$_abs" 2>/dev/null || echo "${_abs}B")"
+  else
+    virt_actual_left_h="$(numfmt --to=iec "${VIRT_ACTUAL_LEFT:-0}" 2>/dev/null || echo "${VIRT_ACTUAL_LEFT:-0}B")"
+  fi
+  # basic json escape helper
+  json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr -d '\n' | sed 's/\r//g'; }
+
+  cat <<JSONEOF
+{
+  "generated_at": "$(date -Is 2>/dev/null || date)",
+  "hostname": "$(json_escape "$JSON_HOSTNAME")",
+  "kernel": "$(json_escape "$(uname -r 2>/dev/null || echo "")")",
+  "uptime": "$(json_escape "$JSON_UPTIME")",
+  "uptime_since": "$(json_escape "$up_s")",
+  "loadavg": $load_json,
+  "cpu": {
+    "cores": "${JSON_CPU_CORES}",
+    "model": "$(json_escape "$JSON_CPU_MODEL")"
+  },
+  "memory": {
+    "mem_total_kb": "${JSON_MEM_TOTAL_KB}",
+    "mem_available_kb": "${JSON_MEM_AVAIL_KB}",
+    "swap_total_kb": "${JSON_SWAP_TOTAL_KB}"
+  },
+  "thresholds": {
+    "disk": $THRESH_DISK,
+    "inode": $THRESH_INODE,
+    "mem": $THRESH_MEM,
+    "swap": $THRESH_SWAP
+  },
+  "alerts": $alerts_json,
+  "top_n": $TOP_N,
+  "virt": {
+    "enabled": $virt_enabled,
+    "host_free_bytes": ${VIRT_HOST_FREE:-0},
+    "host_free_human": "$virt_host_h",
+    "total_virtual_bytes": ${VIRT_TOTAL_VIRTUAL:-0},
+    "total_actual_bytes": ${VIRT_TOTAL_ACTUAL:-0},
+    "total_remaining_bytes": ${VIRT_TOTAL_REMAINING:-0},
+    "actual_left_bytes": ${VIRT_ACTUAL_LEFT:-0},
+    "actual_left_human": "$virt_actual_left_h",
+    "calc": "actual_left = host_free - total_remaining"
+  }
+}
+JSONEOF
+}
+
+# ─── MAIN ───────────────────────────────────────────────────────────────────
+main() {
+  collect_header
+
+  # truncate/create logfile now so streaming appends don't duplicate old content
+  if [[ $DO_FILE -eq 1 && -n "$LOGFILE" && $JSON_ONLY -eq 0 ]]; then
+    mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+    : > "$LOGFILE" 2>/dev/null || true
+  fi
+
+  if [[ $JSON_ONLY -eq 1 ]]; then
+    # if virt enabled, collect virt totals even in json-only (populate globals, no visible output if suppressed)
+    if [[ $DO_VIRT -eq 1 ]]; then
+      # render_virt will not print when JSON_ONLY=1 (append suppressed), but will set totals
+      render_virt
+    fi
+    local j
+    j="$(build_json)"
+    if have jq; then j="$(echo "$j" | jq . 2>/dev/null || echo "$j")"; fi
+    echo "$j"
+    if [[ $DO_FILE -eq 1 && -n "$JSONFILE" ]]; then
+      mkdir -p "$(dirname "$JSONFILE")" 2>/dev/null || true
+      echo "$j" > "$JSONFILE"
+      echo "JSON written to $JSONFILE" >&2
+    fi
+    # alerts exit code
+    if [[ $DO_ALERT -eq 1 && ${#JSON_ALERTS[@]} -gt 0 ]]; then
+      local has_crit=0
+      for a in "${JSON_ALERTS[@]}"; do if echo "$a" | grep -q '"level":"crit"'; then has_crit=1; break; fi; done
+      if [[ $has_crit -eq 1 ]]; then exit 2; else exit 1; fi
+    fi
+    return
+  fi
+
+  # human report — streaming via append() already writes to stdout+file
+  append "${C_BG_DARK}${C_BOLD} sysh — System Health  •  $(date '+%Y-%m-%d %H:%M:%S %Z')  •  ${JSON_HOSTNAME} ${C_RESET}"
+  render_header
+  render_cpu
+  render_memory
+  render_disk
+  render_network
+  render_processes
+  render_services
+  render_logs
+  render_sensors
+  render_virt
+  render_alerts
+  append ""
+  append "${C_DIM}Report generated in $(date) — log: ${LOGFILE:-"(no file)"}  •  thresholds: disk ${THRESH_DISK}% mem ${THRESH_MEM}%${C_RESET}"
+
+  # handle JSON emission after streaming report
+  if [[ $DO_JSON -eq 1 ]]; then
+    local j
+    j="$(build_json)"
+    if have jq; then j="$(echo "$j" | jq . 2>/dev/null || echo "$j")"; fi
+    # emit to stdout with section marker (colors stripped in file via manual)
+    printf '%b\n' "${C_DIM}── JSON ──${C_RESET}"
+    echo "$j"
+    if [[ -n "${LOGFILE:-}" && $DO_FILE -eq 1 ]]; then
+      printf '%s\n' "── JSON ──" >> "$LOGFILE"
+      printf '%s\n' "$j" >> "$LOGFILE"
+    fi
+    if [[ -n "$JSONFILE" && $DO_FILE -eq 1 ]]; then
+      echo "$j" > "$JSONFILE"
+      printf '%b\n' "${C_DIM}JSON written to $JSONFILE${C_RESET}"
+      printf '%s\n' "JSON written to $JSONFILE" >> "$LOGFILE"
+    fi
+  else
+    if [[ $DO_FILE -eq 1 && -n "$LOGFILE" ]]; then
+      printf '%b\n' "${C_DIM}Log written to $LOGFILE${C_RESET}" >&2
+    fi
+  fi
+
+  # exit code based on alerts
+  if [[ $DO_ALERT -eq 1 && ${#JSON_ALERTS[@]} -gt 0 ]]; then
+    local has_crit=0
+    for a in "${JSON_ALERTS[@]}"; do
+      if echo "$a" | grep -q '"level":"crit"'; then has_crit=1; break; fi
+    done
+    if [[ $has_crit -eq 1 ]]; then exit 2; else exit 1; fi
+  fi
+}
+
+main "$@"

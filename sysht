@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# sysht — System Health TUI (bash + rust display)
+# Collects via sysh bash, displays via rust ratatui.
+# Mirrors pdf-search architecture: bash prepares, rust renders.
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SYSH="${SCRIPT_DIR}/sysh"
+TUI_BIN="${SCRIPT_DIR}/sysht-tui/target/release/sysht-tui"
+TOP_N=10
+TIMEOUT=60
+
+usage() {
+  cat <<'EOF'
+sysht — System Health TUI (bash collector + rust display)
+
+Usage: sysht [OPTIONS]
+
+Collects system health via sysh (bash) and displays in a rust ratatui TUI.
+Full version with categorized disk tables, top N files/dirs/packages/docker.
+
+Options:
+  -h, --help          Show help
+  -n, --top N         Top N for tables (default: 10)
+      --sysh PATH     Path to sysh script (default: ./sysh beside sysht)
+      --timeout SEC   Collection timeout (default: 60)
+      --virt          Enable thin-provisioned virtual image scan (like sysh --virt)
+      --no-virt       Disable virt scan (default)
+      --build         Force rebuild rust TUI
+      --no-tui        Only collect and dump raw to stdout (debug)
+
+Keys in TUI:
+  F1-F15 / 1-9,0,s,t,v       Switch views (Overview, CPU, Memory, DiskFS, DiskDirs,
+                             DiskFiles, Packages, Docker, Network, Procs, Svcs/Logs, Sensors, Virt)
+  Tab / n / p                Next/Prev view
+  j/k / Up/Down / PgUp/Dn    Scroll
+  r                          Refresh (re-run sysh)
+  a                          Toggle auto-refresh (5s)
+  ?                          Toggle help
+  q                          Quit
+
+Architecture (like pdf-search):
+  sysht (bash) -> runs sysh --no-file --no-color -n TOP_N [--virt] -> captures raw sections
+              -> calls sysht-tui (rust) which parses sections and renders ratatui tables
+              -> periodic refresh re-invokes sysh via health::collect()
+
+Disk categorization (table view):
+  - Filesystems (df -hT + threshold coloring)
+  - Inodes (df -i)
+  - Block devices (lsblk)
+  - Top Dirs categorized (/home, /var, /opt, /tmp + /usr sample) via timeout-guarded du
+  - Top Files (find /home /var /tmp -printf, timeout 8s) + hint
+  - Top Packages (dpkg-query Installed-Size)
+  - Docker (system df, images, containers, volumes) timeout-guarded
+  - I/O (iostat or /proc/diskstats)
+  - Virt (thin-provisioned qcow2/vdi/vmdk/vhd, LVM thin pools, calc: actual_left = host_free - remaining)
+
+Examples:
+  sysht                     # default top 10
+  sysht -n 20               # more rows
+  sysht --virt -n 20        # include thin virt images + overcommit calc
+  sysht --timeout 90        # longer collection on huge FS
+  sysht --no-tui --virt     # dump raw without TUI but with virt
+
+EOF
+}
+
+BUILD=0
+NO_TUI=0
+DO_VIRT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--top) TOP_N="$2"; shift 2 ;;
+    --sysh) SYSH="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --virt) DO_VIRT=1; shift ;;
+    --no-virt) DO_VIRT=0; shift ;;
+    --build) BUILD=1; shift ;;
+    --no-tui) NO_TUI=1; shift ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! -x "$SYSH" && ! -f "$SYSH" ]]; then
+  echo "sysh not found at $SYSH" >&2; exit 2
+fi
+if [[ ! -x "$SYSH" ]]; then
+  chmod +x "$SYSH" 2>/dev/null || true
+fi
+
+# ensure rust binary exists, build if needed or --build
+if [[ $BUILD -eq 1 || ! -x "$TUI_BIN" ]]; then
+  echo "Building sysht-tui (rust)..."
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo not found, please install rust" >&2; exit 2
+  fi
+  (cd "${SCRIPT_DIR}/sysht-tui" && cargo build --release)
+  if [[ ! -x "$TUI_BIN" ]]; then
+    echo "build failed, binary not found at $TUI_BIN" >&2; exit 2
+  fi
+fi
+
+VIRT_FLAG=""
+if [[ $DO_VIRT -eq 1 ]]; then VIRT_FLAG="--virt"; fi
+
+if [[ $NO_TUI -eq 1 ]]; then
+  echo "Collecting via sysh (--no-file --no-color -n $TOP_N $VIRT_FLAG) timeout ${TIMEOUT}s..."
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$TIMEOUT" bash "$SYSH" --no-file --no-color -n "$TOP_N" $VIRT_FLAG || echo "(collection timed out / partial)"
+  else
+    bash "$SYSH" --no-file --no-color -n "$TOP_N" $VIRT_FLAG
+  fi
+  exit $?
+fi
+
+# verify terminal is interactive
+if [[ ! -t 0 ]] && [[ ! -t 1 ]]; then
+  echo "Warning: not a TTY — TUI requires interactive terminal. Use --no-tui to dump." >&2
+fi
+
+export SYSH
+# Launch TUI — it will internally call health::collect which invokes sysh again
+if [[ $DO_VIRT -eq 1 ]]; then
+  exec "$TUI_BIN" --sysh "$SYSH" --top "$TOP_N" --timeout "$TIMEOUT" --virt
+else
+  exec "$TUI_BIN" --sysh "$SYSH" --top "$TOP_N" --timeout "$TIMEOUT"
+fi
